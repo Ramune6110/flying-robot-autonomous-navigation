@@ -14,8 +14,7 @@ A bare-metal embedded firmware implementation for autonomous flight control of a
 6. [Configuration & Calibration](#configuration--calibration)
 7. [Usage](#usage)
 8. [Directory Structure](#directory-structure)
-9. [Author](#author)
-10. [License](#license)
+9. [License](#license)
 
 ---
 
@@ -177,12 +176,6 @@ flight-robot-autonomy/
 ├─ LICENSE            # MIT License
 └─ README.md          # This document
 ```
-
----
-
-## Author
-
-**Keigo Miyama** – Original firmware architect and developer.
 
 ---
 
