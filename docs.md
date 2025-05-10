@@ -15,12 +15,119 @@
 
 ## 第2章: ハードウェア定義とマクロ
 
-* `#define ACCEL_2G_LSB 16384.0` など: センサー固有の分解能変換係数.
-* `MPU6000_ADDRESS 0b11010010` 等: I2C アドレスおよびレジスタ定義.
-* `TIM1_CH1 = GPIO_Pin_9` など: PWM 出力チャネルのピン定義.
-* 割り込み優先度マクロ: `EXTI0_PRIORITY` など.
+コード冒頭で多くの `#define` マクロが並んでいますが、これらはハードウェア仕様や定数を中央集権的に管理し、以下のメリットを提供します：
 
-これらマクロでピンやレジスタ番号を一元管理し，後の設定関数で利用。
+* **可読性**: ソース中に "0x3B" と直接書くより `MPU6000_ACCEL_XOUT_H` と書いたほうが何を意味するか瞬時に理解できる
+* **保守性**: センサーやピン配置を変更する際、コード全体を探す必要なく定義部だけ更新すればよい
+* **ドキュメント**: 定義名がそのまま仕様書代わりになる
+* **型安全**: マジックナンバーではなく意味のある名前で扱う
+
+以下、主要な定義群と設計思想をコード例交えて解説します。
+
+### 2.1 センサー分解能・スケール定数
+
+```c
+#define ACCEL_2G_LSB      16384.0   // 2g フルスケールで 1g=16384 LSB (MPU6000)
+#define GYRO_500DEG_LSB    65.5      // 500°/s フルスケールで 1 LSB=65.5°/s
+#define MAG_LSB           32768.0    // 磁力計 ±1000mGauss で 1 mGauss ≒ 32768 LSB
+#define GRAVITY_ACCLE     9.80665    // 地球重力加速度 [m/s²]
+```
+
+* **設計思想**: センサー生データを物理単位に変換する際、これらの「分母」や換算係数が不可欠。マクロでまとめることで、変換ロジック（`raw/ACCEL_2G_LSB*GRAVITY_ACCLE`）がシンプルに。
+* **ポイント**: テスタやデータシートに記載された分解能値を、そのままマクロに置く。
+
+### 2.2 サーボ PWM デューティ定義
+
+```c
+#define AILERON_DUTY_VAL    1    // Dummy: 後で使うかも？
+#define ELEVATOR_DUTY_VAL   1
+#define RUDDER_DUTY_VAL     1
+
+#define AILERON_MAX        40   // サーボ角度上限 [deg]
+#define AILERON_MIN       -40   // 下限
+#define ELEVATOR_MAX       40
+#define ELEVATOR_MIN      -40
+#define RUDDER_MAX         40
+#define RUDDER_MIN        -40
+```
+
+* **設計思想**: サーボ角度レンジと制御限界を明示。PID 出力をこれら `*_MAX/MIN` でクリップし、サーボ破損を防止。
+* `*_DUTY_VAL` は実装上不要ですが、後の拡張用プレースホルダとして残す場合あり。
+
+### 2.3 I²C アドレス＆レジスタ定義
+
+```c
+// MPU6000 (0x68) 用 I2C アドレス + レジスタ
+#define MPU6000_ADDRESS         0b11010010
+#define MPU6000_ACCEL_XOUT_H    0x3B
+#define MPU6000_PWR_MGMT_1      0x6B
+#define MPU6000_WHO_AM_I        0x75
+#define MPU6000_CHIPID          0x68
+
+// MAG3110 用
+#define MAG3110_ADDRESS         0b00011100
+#define MAG3110_OUT_X_MSB       0x01
+#define MAG3110_WHO_AM_I        0x07
+#define MAG3110_CHIPID          0xC4
+
+// BMP280 用
+#define BMP280_ADDRESS          0b11101100
+#define BMP280_DIG_T1           0x88
+#define BMP280_CTRL_MEAS        0xF4
+#define BMP280_WHO_AM_I         0xD0
+#define BMP280_CHIPID           0x58
+```
+
+* **設計思想**: 各センサーの I2C アドレスは 7-bit + R/W ビット形式で定義。
+
+  * 例: `0b1101001` (7bit) <<1 ＋ R/W ビット 0 → `0b11010010`
+* レジスタオフセットも同様にマクロ化し、I²C コマンド部分 (`i2c2Read(..., MPU6000_WHO_AM_I)`) が何を意味するか一目瞭然。
+
+### 2.4 Arduino I2C アドレス
+
+```c
+#define ARDUINO_ADDRESS         1
+```
+
+* **設計思想**: センサーとは別系統の I2C バス（I2C1）で，Arduino から電圧値取得。マイコン間通信用途の識別子。
+
+### 2.5 ピンマッピング（タイマー・EXTI）
+
+```c
+// E タイマー入力ピンマスク
+#define PE0_5           0x003f   // PE0~PE5 ビットマスク
+
+// TIM1 PWM 出力チャネル
+#define TIM1_CH1        GPIO_Pin_9
+#define TIM1_CH2        GPIO_Pin_11
+#define TIM1_CH3        GPIO_Pin_13
+#define TIM1_CH4        GPIO_Pin_14
+
+// TIM4 PWM 出力チャネル
+#define TIM4_CH1        GPIO_Pin_12
+// ... TIM4_CH4
+```
+
+* **設計思想**: 物理ピンと機能（PWM, EXTI）の紐付けを一元管理。
+* `GPIO_Pin_X` は STM32 標準ヘッダでビットマスク定義済。
+
+### 2.6 割り込み優先度定義
+
+```c
+#define EXTI0_PRIORITY      1
+#define EXTI1_PRIORITY      2
+// ...
+#define TIM2_PRIORITY       20
+```
+
+* **設計思想**: 割り込み優先度はプロジェクト／システム要件に応じて調整が必要。
+
+  * 例: RC 信号キャプチャ(EXTI) は最優先、制御ループ(TIM6) は中程度、ログ出力は低優先。
+* 優先度だけマクロ化し、後からチューニングしやすく。
+
+---
+
+これら定数定義は、後続の設定関数（GPIO\_Init, I2C\_Init, TIM\_TimeBaseInit など）で読み込まれ、1行1行がハードウェア仕様書（データシート）の写像になっています。組み込み開発ではマジックナンバーを避け、仕様書通りの定義を見出しつきで管理することが設計の基本です。
 
 ## 第3章: 初期化処理
 
