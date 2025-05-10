@@ -212,7 +212,7 @@ void ADC_DMA_Configuration(void) {
 
 ---
 
-以上で Chapter 3 初期化処理の詳細解説を終わります。各専門用語の役割と実装方法も含めましたので，次はこれらを動作させるコードの全体フローをイメージしてみてください。: 周辺機能設定
+## 第4章周辺機能設定
 
 ### 4.1 タイマー設定
 
@@ -230,6 +230,243 @@ void ADC_DMA_Configuration(void) {
 * I2C2: MPU6000/MAG3110/BMP280 用
 * USART1 + DMA1\_Channel4: ログ送出，DMA1\_Channel5: 受信
 * ADC\_DMA: ADC1 によるアナログ入力 (Battery 電圧等)
+
+以下、「第4章：割り込み設計とペリフェラル設定」という構成で解説します。中盤以降にコード抜粋を交えながら、
+
+* 割り込み処理の設計思想
+* I2C1／I2C2／USART1 と DMA 設定の具体的中身
+* MCU の「ペリフェラル」とは何か、このプロジェクトで何を使っているか
+
+を順にカバーします。組み込み初心者の方にもわかるよう、用語ごとに役割と実装方法も補足しています。
+
+---
+
+## 4-1. MCU ペリフェラル（周辺機能）とは？
+
+マイコン（MCU）の「ペリフェラル」とは、CPU コアの外側にある入出力や制御を司るハードウェア機能全般を指します。代表的なものは：
+
+* **GPIO**（General-Purpose I/O）… 汎用的なデジタル入出力ピン。LED やスイッチとの接続に使う。
+* **タイマ／カウンタ**… 時間計測や PWM 信号生成、割り込み周期のトリガに利用。
+* **UART／USART**… シリアル通信（PC や XBee など）に使う。
+* **I²C, SPI**… センサーや外部 EEPROM などとのバス通信に使う。
+* **ADC／DAC**… アナログ信号の A/D 変換や D/A 変換に使う。
+* **DMA**… メモリ⇔ペリフェラル間のデータ転送を CPU 不使用で自動化。
+* **外部割り込み（EXTI）**… ピン変化をトリガに高速割り込みを発生。
+* **NVIC**… Cortex-M 系の割り込み制御ブロック（割り込み優先度・マスクを管理）。
+
+このプロジェクトでは、上記ほぼすべてを活用し、センサー読み出し→姿勢推定→PID→サーボ駆動の一連を割り込みで高速かつ効率的に実現しています。
+
+---
+
+## 4-2. 割り込み処理の設計思想
+
+1. **周期割り込み（タイマ）による処理分担**
+
+   * TIM5（50 Hz）：センサー取得＋Madgwick姿勢推定
+   * TIM6（20 Hz）：PID 制御ループ
+   * TIM2（10 Hz）：I²C エラー監視・例外ログ
+   * TIM8：RC 信号取得→PWM出力更新
+   * その他、TIM1/TIM4 で PWM → サーボ直接制御
+
+2. **ピン変化割り込み（EXTI）による RC 受信**
+
+   * RC 受信機のパルス幅計測は PE0–PE5 を EXTI0–EXTI5 でキャプチャし、SysTick カウンタと組み合わせて高分解能計測。
+
+3. **NVIC による優先度制御**
+
+   * 各割り込みにプリエンプション優先度を設定し、センサ取得や PID よりも RC パルス計測（EXTI）を高優先度に。遅くてもいいログ出力は低優先度に。
+
+> **設計ポイント**：
+>
+> * 「時間決め打ちの制御」はタイマ割り込みで確実に周期実行
+> * 「外部イベント」は EXTI 割り込みでキャプチャ
+> * 「複数割り込みの共存」は NVIC 優先度で調整
+
+---
+
+## 4-3. EXTI／NVIC 設定（RC 信号計測）
+
+```c
+void EXTI_Configuration(void) {
+  // (1) GPIOE ピン 0–5 をプルダウン入力に
+  RCC_APB2PeriphClockCmd(RCC_APB2Periph_AFIO | RCC_APB2Periph_GPIOE, ENABLE);
+  GPIO_InitTypeDef gpio = {
+    .GPIO_Pin   = GPIO_Pin_0|GPIO_Pin_1|...|GPIO_Pin_5,
+    .GPIO_Mode  = GPIO_Mode_IPD,   // プルダウン
+    .GPIO_Speed = GPIO_Speed_50MHz
+  };
+  GPIO_Init(GPIOE, &gpio);
+
+  // (2) PE0–PE5 を EXTI ライン 0–5 にマッピング
+  for(int pin=0; pin<=5; pin++){
+    GPIO_EXTILineConfig(GPIO_PortSourceGPIOE, pin);
+  }
+
+  // (3) EXTI0 (PE0) は立ち上がり/立ち下がり両トリガ
+  EXTI_InitTypeDef exti = {
+    .EXTI_Line    = EXTI_Line0,
+    .EXTI_Mode    = EXTI_Mode_Interrupt,
+    .EXTI_Trigger = EXTI_Trigger_Rising_Falling,
+    .EXTI_LineCmd = ENABLE
+  };
+  EXTI_Init(&exti);
+
+  // (4) PE1–PE5 は立ち下がりのみキャプチャ
+  exti.EXTI_Line    = EXTI_Line1 | ... | EXTI_Line5;
+  exti.EXTI_Trigger = EXTI_Trigger_Falling;
+  EXTI_Init(&exti);
+
+  // (5) NVIC に割り込み優先度を登録
+  NVIC_PriorityGroupConfig(NVIC_PriorityGroup_4);
+  NVIC_InitTypeDef nvic = {
+    .NVIC_IRQChannelPreemptionPriority = EXTI0_PRIORITY,
+    .NVIC_IRQChannelSubPriority        = 0,
+    .NVIC_IRQChannelCmd                = ENABLE
+  };
+  for(int irq=EXTI0_IRQn; irq<=EXTI9_5_IRQn; irq++){
+    nvic.NVIC_IRQChannel = irq;
+    NVIC_Init(&nvic);
+  }
+
+  EXTI_ClearITPendingBit(0x003F);
+}
+```
+
+* **GPIO\_Mode\_IPD**：引き脚（プルダウン）付き入力。アイドル時に 0 V に保つ。
+* **EXTI\_Trigger\_Rising\_Falling**：立ち上がり・立ち下がり両方検知。
+
+PE0→SysTick→PE0→SysTick 差分からパルス幅計測し、RCサーボ信号を得ています。
+
+---
+
+## 4-4. DMA 設定（USART1 TX/RX）
+
+```c
+void DMA1_Configuration(uint32_t memAddr, uint16_t bufSize) {
+  RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA1, ENABLE);
+  DMA_DeInit(DMA1_Channel4);
+
+  DMA_InitTypeDef dma = {
+    .DMA_PeripheralBaseAddr = (uint32_t)&USART1->DR,
+    .DMA_MemoryBaseAddr     = memAddr,
+    .DMA_DIR                = DMA_DIR_PeripheralDST,  // メモリ→USART1
+    .DMA_BufferSize         = bufSize,
+    .DMA_PeripheralInc      = DMA_PeripheralInc_Disable,
+    .DMA_MemoryInc          = DMA_MemoryInc_Enable,
+    .DMA_PeripheralDataSize = DMA_MemoryDataSize_Byte,
+    .DMA_MemoryDataSize     = DMA_MemoryDataSize_Byte,
+    .DMA_Mode               = DMA_Mode_Normal,
+    .DMA_Priority           = DMA_Priority_VeryHigh
+  };
+  DMA_Init(DMA1_Channel4, &dma);
+}
+```
+
+* **DMA（Direct Memory Access）**：CPU を介さず、ペリフェラルとメモリ間で自動転送。
+* チャネル4 を USART1\_TX に紐づけ、`sendData()` 呼び出しで DMA 転送→TX 送信完了待ち。
+
+---
+
+## 4-5. I²C1／I²C2 設定（センサー・Arduino 通信）
+
+```c
+void I2C1_Configuration(void) {
+  RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+  RCC_APB1PeriphClockCmd(RCC_APB1Periph_I2C1, ENABLE);
+
+  // PB6=SCL, PB7=SDA をオープンドレイン出力に
+  GPIO_InitTypeDef gpio = {
+    .GPIO_Pin   = GPIO_Pin_6|GPIO_Pin_7,
+    .GPIO_Mode  = GPIO_Mode_AF_OD,
+    .GPIO_Speed = GPIO_Speed_50MHz
+  };
+  GPIO_Init(GPIOB, &gpio);
+
+  // I2C1 本体の設定
+  I2C_InitTypeDef i2c = {
+    .I2C_ClockSpeed      = 400000,                  // 400 kHz
+    .I2C_Mode            = I2C_Mode_I2C,
+    .I2C_DutyCycle       = I2C_DutyCycle_2,
+    .I2C_Ack             = I2C_Ack_Enable,
+    .I2C_AcknowledgedAddress = I2C_AcknowledgedAddress_7bit
+  };
+  I2C_Init(I2C1, &i2c);
+  I2C_Cmd(I2C1, ENABLE);
+}
+
+// I2C2 は PB10/SCL, PB11/SDA、センサー（MPU6000, MAG3110, BMP280）用
+void I2C2_Configuration(void) {
+  // （略：I2C1 とほぼ同じで、ペリフェラルが I2C2）
+}
+```
+
+* **GPIO\_Mode\_AF\_OD**：I²C バス用の開放型ドレイン。
+* 400 kHz の高速モードでセンサーをポーリング読み出し。
+
+---
+
+## 4-6. USART1 設定（XBee／シリアルコンソール）
+
+```c
+void USART1_Configuration(void) {
+  // クロック供給
+  RCC_APB2PeriphClockCmd(RCC_APB2Periph_USART1 | RCC_APB2Periph_GPIOA, ENABLE);
+  RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA1, ENABLE);
+
+  // PA9=TX: AF Push-Pull, PA10=RX: Floating Input
+  GPIO_InitTypeDef gpio = {
+    .GPIO_Pin   = GPIO_Pin_9,
+    .GPIO_Mode  = GPIO_Mode_AF_PP,
+    .GPIO_Speed = GPIO_Speed_50MHz
+  };
+  GPIO_Init(GPIOA, &gpio);
+  gpio.GPIO_Pin = GPIO_Pin_10;
+  gpio.GPIO_Mode = GPIO_Mode_IN_FLOATING;
+  GPIO_Init(GPIOA, &gpio);
+
+  // DMA Channel5 を USART1_RX に設定
+  DMA_InitTypeDef dma = { /* RX 用設定 */ };
+  DMA_Init(DMA1_Channel5, &dma);
+  DMA_Cmd(DMA1_Channel5, ENABLE);
+  DMA_ITConfig(DMA1_Channel5, DMA_IT_TC, ENABLE);
+
+  // USART1 本体設定
+  USART_InitTypeDef usart = {
+    .USART_BaudRate            = 115200,
+    .USART_WordLength          = USART_WordLength_8b,
+    .USART_StopBits            = USART_StopBits_1,
+    .USART_Parity              = USART_Parity_No,
+    .USART_HardwareFlowControl = USART_HardwareFlowControl_None,
+    .USART_Mode                = USART_Mode_Rx | USART_Mode_Tx
+  };
+  USART_Init(USART1, &usart);
+  USART_DMACmd(USART1, USART_DMAReq_Tx, ENABLE);
+  USART_Cmd(USART1, ENABLE);
+}
+```
+
+* **USART\_Mode\_RX|TX**：双方向シリアル通信を有効化。
+* **DMAReq\_Tx**：送信も DMA 連携で効率化。
+
+---
+
+## 4-7. 割り込み設計のまとめとポイント
+
+1. **周期制御**…タイマ割り込みで必ず一定周期に処理を呼び出し
+2. **イベント制御**…EXTI＋SysTick で外部パルス幅を高分解能でキャプチャ
+3. **DMA 連携**…大量データ転送（シリアルや A/D）を CPU 負荷ゼロで実行
+4. **NVIC 優先度**…安全に複数割り込みを共存させ、最も重要な信号取得を最優先
+
+各ペリフェラルの役割を理解し、用途に応じて「割り込み or ポーリング」「DMA or CPU転送」を選ぶのが組み込み設計のキモです。今回のコードでは、
+
+* **I²C**：センサー制御（ポーリング＋エラー監視）
+* **USART + DMA**：XBee／デバッグ出力（大容量文字列）
+* **EXTI + SysTick**：RC 信号計測
+* **TIMx**：周期処理／PWM
+
+をうまく使い分けています。
+
+---
 
 ## 第5章: センサー読み取りと変換
 
