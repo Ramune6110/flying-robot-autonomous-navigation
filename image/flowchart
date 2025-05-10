@@ -1,0 +1,177 @@
+@startuml
+!theme plain
+
+|main|
+start
+:BoardInit();
+:GPIO_Configuration();
+:SysTick_Configuration();
+:ADC_DMA_Configuration();
+:I2C1_Configuration();
+:I2C2_Configuration();
+:USART1_Configuration();
+:sendData("USART1 Transmit Check\r\n");
+:Sensor_ConectionCheck();
+:MPU6000_Configuration();
+:MAG3110_Configuration();
+:BMP280_Configuration();
+:TIM1_Configuration();
+:TIM2_Configuration();
+:TIM3_Configuration();
+:TIM4_Configuration();
+:TIM5_Configuration();
+:TIM6_Configuration();
+:TIM7_Configuration(usec);  
+:TIM8_Configuration();
+while (1)
+  :Idle Loop;
+endwhile
+stop
+
+|Interrupts|
+fork
+  :TIM2_IRQHandler();
+  note right
+    if(TIM_IT_Update) clear pending;
+    log I2C exceptions;
+  end note
+fork again
+  :TIM5_IRQHandler();
+  note right
+    if(CalibrationFlag) MAG3110_Calibration();
+    else {
+      MPU6000_getParameter();
+      MAG3110_getParameter();
+      BMP280_altitude();
+      MadgwickAHRS(...);
+    }
+    Toggle_LED();
+  end note
+fork again
+  :TIM6_IRQHandler();
+  note right
+    clear pending;
+    if(!CalibrationFlag) {
+      if(ControlFlag) {
+        PID_TimerReset if mode changed;
+        compute relativeYaw;
+        select ControlMode;
+        if(eightCircleMode==2) PID_Roll_Controller();
+        else PID_Controller();
+        sendDataPID/Option();
+      } else {
+        reset control flags;
+        sendDataOption();
+      }
+    }
+  end note
+fork again
+  :TIM8_UP_IRQHandler();
+  note right
+    clear pending;
+    Convert_ReceiverData_to_PWM();
+    if(throttle>1735) {
+      ControlFlag=TRUE; mode logic;
+      set PWM via TIM_SetCompare(...);
+    } else {
+      ControlFlag=FALSE;
+      pass-through PWM;
+    }
+    R6Flag logic;
+  end note
+fork again
+  :EXTI0_IRQHandler();
+  note right
+    clear pending;
+    if(rising) { SysTick->VAL=0xFFFFFF; Flag_EXTI=1; }
+    else if(Flag_EXTI) Receiver_Data[1]=0xFFFFFF-SysTick->VAL;
+  end note
+fork again
+  :EXTI1_IRQHandler();
+  note right
+    clear pending;
+    if(Flag_EXTI) {
+      Receiver_Data[2]=prev - SysTick->VAL; update prev;
+    }
+  end note
+fork again
+  :EXTI2_IRQHandler(); // similar to EXTI1
+fork again
+  :EXTI3_IRQHandler(); // similar to EXTI1
+fork again
+  :EXTI4_IRQHandler(); // similar to EXTI1
+fork again
+  :EXTI9_5_IRQHandler();
+  note right
+    if(Flag_EXTI) { Receiver_Data[6]=prev - VAL; Flag_EXTI=0; }
+  end note
+fork again
+  :DMA1_Channel5_IRQHandler();
+  note right
+    if(transfer complete) send received data and halt;
+  end note
+end fork
+
+|I2C1|
+: i2c1Read()/i2c1Write();
+note right
+  START → Address+W → RegAddr → ReSTART → Address+R → Read byte
+end note
+
+|I2C2|
+: i2c2Read()/i2c2Write();
+note right
+  similar to I2C1 for sensors
+end note
+
+|Sensor|
+fork
+  :MPU6000_getParameter();
+  :MAG3110_getParameter();
+  :MAG3110_Calibration();
+  :BMP280_getTrimParameter();
+  :BMP280_getParameter();
+  :BMP280_temperature();
+  :BMP280_pressure();
+  :BMP280_altitude();
+end fork
+
+|Control|
+fork
+  :PID_Controller();
+  :PI_D_Controller();
+  :I_PD_Controller();
+  :PID_Roll_Controller();
+  :PI_D_Roll_Controller();
+  :I_PD_Roll_Controller();
+  :antiWindUp();
+  :aileronDeg2Duty()/elevatorDeg2Duty()/rudderDeg2Duty();
+  :normalize();
+end fork
+
+|AHRS|
+fork
+  :Madgwick_Init();
+  :MadgwickAHRS();
+  note right
+    if(mx,my,mz==0) call MadgwickAHRS_IMU();
+  end note
+  :MadgwickAHRS_IMU();
+  :computeAngles();
+  :getPhi()/getTheta()/getPsi();
+  :invSqrt();
+end fork
+
+|Utility|
+fork
+  :Toggle_LED();
+  :_delay_us();
+  :_delay_ms();
+  :sendData();
+  :sendDataOption();
+  :sendDataOffset();
+  :sendDataCalibration();
+  :sendDataPID();
+end fork
+
+@enduml
